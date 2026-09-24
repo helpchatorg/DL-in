@@ -6490,15 +6490,52 @@
         updateWaitlistNotifDot();
     }
 
+    let _modelsPromise = null;
+    function _withTimeout(promise, ms, label) {
+        return Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error(label + ' timed out')), ms))]);
+    }
     async function loadModels() {
         if (isModelsLoaded) return;
-        const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model';
-        await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
-        // Landmark model is required for the blink-based liveness check below —
-        // without it, any photo of a face (printed or on another screen) would
-        // pass the old "is a face visible" test.
-        await faceapi.nets.faceLandmark68TinyNet.loadFromUri(MODEL_URL);
-        isModelsLoaded = true;
+        if (_modelsPromise) return _modelsPromise;
+        const URLS = ['https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model', 'https://cdn.jsdelivr.net/gh/vladmandic/face-api/model'];
+        _modelsPromise = (async () => {
+            let lastErr = null;
+            for (const url of URLS) {
+                try {
+                    // Landmark model is required for the blink-based liveness check.
+                    await _withTimeout(faceapi.nets.tinyFaceDetector.loadFromUri(url), 25000, 'AI model download');
+                    await _withTimeout(faceapi.nets.faceLandmark68TinyNet.loadFromUri(url), 25000, 'AI model download');
+                    isModelsLoaded = true;
+                    return;
+                } catch (e) { lastErr = e; console.error('Model load failed from', url, e); }
+            }
+            throw lastErr || new Error('AI models could not be loaded');
+        })();
+        try { await _modelsPromise; } finally { if (!isModelsLoaded) _modelsPromise = null; }
+    }
+
+    // Opens the camera; if the preferred resolution is refused, falls back to plain facingMode.
+    async function getCamStream(facing) {
+        try {
+            return await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } } });
+        } catch (e) {
+            console.warn('Preferred camera constraints failed, retrying with defaults', e);
+            return await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing } });
+        }
+    }
+    // Resolves once the <video> is actually delivering frames.
+    function waitVideoReady(video, ms) {
+        return new Promise((resolve, reject) => {
+            const t0 = Date.now();
+            const check = () => {
+                if (!video.srcObject) return reject(new Error('camera closed'));
+                if (video.readyState >= 2 && video.videoWidth > 0) return resolve();
+                if (Date.now() - t0 > ms) return reject(new Error('camera did not start'));
+                setTimeout(check, 100);
+            };
+            try { const pr = video.play(); if (pr && pr.catch) pr.catch(() => {}); } catch (e) {}
+            check();
+        });
     }
 
     // Eye Aspect Ratio: standard measure used for blink detection.
@@ -6545,12 +6582,13 @@
         try {
             await loadModels();
             const video = document.getElementById('live-video');
-            const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: liveCamFacing, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } } });
+            const stream = await getCamStream(liveCamFacing);
             video.srcObject = stream;
             video.classList.toggle('mirrored-preview', liveCamFacing === 'user');
             detectHuman();
         } catch(e) {
-            alert("Camera access denied or not available."); closeLiveCamera();
+            console.error('Live camera start failed', e);
+            alert((e && /model|timed out|fetch|network/i.test(e.message || '')) ? "AI models could not be loaded. Please check your internet connection and try again." : "Camera access denied or not available."); closeLiveCamera();
         }
     }
 
@@ -6563,12 +6601,20 @@
         liveCamFacing = (liveCamFacing === 'user') ? 'environment' : 'user';
         setCamStatus('loading', '🔄', 'Switching Camera...', false);
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: liveCamFacing, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } } });
+            const stream = await getCamStream(liveCamFacing);
             video.srcObject = stream;
             video.classList.toggle('mirrored-preview', liveCamFacing === 'user');
             detectHuman();
         } catch(e) {
+            console.error('Camera switch failed', e);
             alert("Unable to switch camera on this device.");
+            liveCamFacing = (liveCamFacing === 'user') ? 'environment' : 'user';
+            try {
+                const back = await getCamStream(liveCamFacing);
+                video.srcObject = back;
+                video.classList.toggle('mirrored-preview', liveCamFacing === 'user');
+                detectHuman();
+            } catch (e2) { setCamStatus('error', '', 'Camera unavailable. Please close and reopen.', false); }
         }
     }
 
@@ -6603,6 +6649,15 @@
         let eyeWasClosed = false;
 
         const resetAll = () => { stableFaceFrames = 0; eyeWasClosed = false; blinkVerified = false; blinkVerifiedAt = 0; };
+
+        let errorStreak = 0;
+        try { await waitVideoReady(video, 8000); }
+        catch (e) {
+            if (runId === window._detectRunId) setCamStatus('error', '', 'Camera is not responding. Tap the flip button or reopen the camera.', false);
+            return;
+        }
+        if (runId !== window._detectRunId) return;
+        setCamStatus('scanning', '', 'Scanning... position your face clearly', false);
 
         const tick = async () => {
             if (runId !== window._detectRunId) return;
@@ -6647,7 +6702,12 @@
                         }
                     }
                 }
-            } catch (e) { /* ignore a failed frame and keep going */ }
+                errorStreak = 0;
+            } catch (e) {
+                errorStreak++;
+                if (errorStreak === 1) console.error('Face detection frame failed', e);
+                if (errorStreak >= 25) setCamStatus('error', '', 'Face detection is not working on this device/browser. Please reload the page.', false);
+            }
             if (runId === window._detectRunId && video.srcObject) detectionInterval = setTimeout(tick, CHECK_GAP_MS);
         };
         tick();
